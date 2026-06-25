@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Lokale config (credentials, token, state, lock) - niet in repo
+config/
+
+# Lokale logs
+logs/

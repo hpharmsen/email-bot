@@ -7,7 +7,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from email_bot.claude_runner import Outcome, _load_env_file, build_prompt, run
+from email_bot.claude_runner import (
+    Outcome, _is_transient_failure, _load_env_file, build_prompt, run,
+)
 from email_bot.gmail_client import ParsedMessage
 
 
@@ -229,6 +231,113 @@ def test_run_kills_process_group_even_on_timeout(tmp_path):
             patch('email_bot.claude_runner._kill_process_group') as killpg:
         run('p', tmp_path, tmp_path / 'log.txt', timeout=10)
     assert killpg.called
+
+
+# --- retry on transient API failures ---
+
+def _transient_payload(msg='API Error: Stream idle timeout - partial response received'):
+    """Mirror van de echte CLI-output bij een idle-stream failure (0 tokens, 1 turn)."""
+    return json.dumps({
+        'type': 'result', 'subtype': 'success', 'is_error': True,
+        'result': msg, 'num_turns': 1,
+        'usage': {'input_tokens': 0, 'output_tokens': 0},
+    })
+
+
+def test_is_transient_failure_recognizes_stream_idle():
+    payload = json.loads(_transient_payload())
+    assert _is_transient_failure(payload) is True
+
+
+def test_is_transient_failure_recognizes_broken_pipe():
+    payload = json.loads(_transient_payload('Broken pipe while streaming'))
+    assert _is_transient_failure(payload) is True
+
+
+def test_is_transient_failure_false_when_tokens_used():
+    """Als het model al werk heeft gedaan mogen we NIET retryen — risico op dubbele commits."""
+    payload = json.loads(_transient_payload())
+    payload['usage']['output_tokens'] = 500
+    assert _is_transient_failure(payload) is False
+
+
+def test_is_transient_failure_false_for_max_turns():
+    payload = {'subtype': 'error_max_turns', 'result': 'too complex',
+               'usage': {'input_tokens': 0, 'output_tokens': 0}, 'num_turns': 200}
+    assert _is_transient_failure(payload) is False
+
+
+def test_is_transient_failure_false_for_unknown_error():
+    payload = json.loads(_transient_payload('Permission denied'))
+    assert _is_transient_failure(payload) is False
+
+
+def test_run_retries_transient_failure_then_succeeds(tmp_path):
+    success_stdout = json.dumps({'action': 'committed', 'summary': 'Klaar.'})
+    proc_fail = _mock_proc(stdout=_transient_payload(), returncode=1)
+    proc_ok = _mock_proc(stdout=success_stdout, returncode=0)
+    with patch('email_bot.claude_runner.subprocess.Popen', side_effect=[proc_fail, proc_ok]), \
+            patch('email_bot.claude_runner._kill_process_group'), \
+            patch('email_bot.claude_runner.time.sleep') as sleep:
+        outcome = run('p', tmp_path, tmp_path / 'log.txt')
+    assert outcome.kind == 'committed'
+    assert outcome.summary == 'Klaar.'
+    sleep.assert_called_once_with(30)
+
+
+def test_run_exhausts_retries_on_persistent_transient_failure(tmp_path):
+    proc_fail = _mock_proc(stdout=_transient_payload(), returncode=1)
+    with patch('email_bot.claude_runner.subprocess.Popen', return_value=proc_fail) as popen, \
+            patch('email_bot.claude_runner._kill_process_group'), \
+            patch('email_bot.claude_runner.time.sleep') as sleep:
+        outcome = run('p', tmp_path, tmp_path / 'log.txt')
+    assert popen.call_count == 3  # 1 + 2 retries
+    assert sleep.call_args_list == [((30,),), ((90,),)]
+    assert outcome.kind == 'error'
+    assert 'na 3 pogingen' in outcome.summary
+    assert 'Stream idle timeout' in outcome.summary
+
+
+def test_run_does_not_retry_non_transient_error(tmp_path):
+    """Permission denied / login required = niet retryen, anders spammen we de API."""
+    bad = json.dumps({
+        'type': 'result', 'is_error': True,
+        'result': 'Not logged in', 'num_turns': 1,
+        'usage': {'input_tokens': 0, 'output_tokens': 0},
+    })
+    proc = _mock_proc(stdout=bad, returncode=1)
+    with patch('email_bot.claude_runner.subprocess.Popen', return_value=proc) as popen, \
+            patch('email_bot.claude_runner._kill_process_group'), \
+            patch('email_bot.claude_runner.time.sleep') as sleep:
+        outcome = run('p', tmp_path, tmp_path / 'log.txt')
+    assert popen.call_count == 1
+    sleep.assert_not_called()
+    assert outcome.kind == 'error'
+    assert 'Not logged in' in outcome.summary
+
+
+def test_run_does_not_retry_max_turns_error(tmp_path):
+    stdout = json.dumps({
+        'subtype': 'error_max_turns', 'result': 'hit max turns',
+        'num_turns': 200, 'usage': {'input_tokens': 1000, 'output_tokens': 500},
+    })
+    proc = _mock_proc(stdout=stdout, returncode=1)
+    with patch('email_bot.claude_runner.subprocess.Popen', return_value=proc) as popen, \
+            patch('email_bot.claude_runner._kill_process_group'), \
+            patch('email_bot.claude_runner.time.sleep') as sleep:
+        outcome = run('p', tmp_path, tmp_path / 'log.txt')
+    assert popen.call_count == 1
+    sleep.assert_not_called()
+    assert outcome.kind == 'error'
+    assert 'te complex' in outcome.summary
+
+
+def test_run_success_first_attempt_no_sleep(tmp_path):
+    stdout = json.dumps({'action': 'committed', 'summary': 'OK.'})
+    with _patched_popen(_mock_proc(stdout=stdout)), \
+            patch('email_bot.claude_runner.time.sleep') as sleep:
+        run('p', tmp_path, tmp_path / 'log.txt')
+    sleep.assert_not_called()
 
 
 # --- _load_env_file ---

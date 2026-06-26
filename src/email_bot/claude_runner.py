@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import signal
@@ -11,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .gmail_client import ParsedMessage
+
+log = logging.getLogger(__name__)
 
 _OUTPUT_SCHEMA = json.dumps({
     'type': 'object',
@@ -46,6 +49,20 @@ _ALLOWED_TOOLS = (
 DEFAULT_TIMEOUT = 1500
 DEFAULT_MAX_TURNS = 200
 DEFAULT_BUDGET_USD = '8.00'
+
+# Retry alleen op fouten waarbij Claude de prompt aantoonbaar nooit heeft verwerkt
+# (0 tokens, exit non-zero). Anders riskeren we dubbel werk (twee commits voor
+# één mail). Backoff in seconden voor 1e en 2e retry.
+DEFAULT_MAX_RETRIES = 2
+RETRY_BACKOFF_SECONDS = (30, 90)
+_TRANSIENT_RESULT_PATTERNS = (
+    'stream idle timeout',
+    'connection error',
+    'econnreset',
+    'etimedout',
+    'overloaded',
+    'broken pipe',
+)
 
 # Fallback-paden voor wanneer cron met minimale PATH draait.
 _CLAUDE_FALLBACK_PATHS = (
@@ -228,10 +245,28 @@ Daarna: return {{"action":"committed","summary":"<1-2 zinnen wat je deed>","veri
 """
 
 
+def _is_transient_failure(payload: dict) -> bool:
+    """Exit non-zero met 0 tokens en 0 turns = Claude heeft de prompt nooit
+    verwerkt (API-stream idle, broken pipe). Veilig om te retryen — er is geen
+    werk gedaan dat dubbel zou kunnen lopen."""
+    usage = payload.get('usage') or {}
+    no_work_done = (
+        usage.get('input_tokens', 0) == 0
+        and usage.get('output_tokens', 0) == 0
+        and payload.get('num_turns', 0) <= 1
+    )
+    if not no_work_done:
+        return False
+    result_msg = (payload.get('result') or '').lower()
+    return any(p in result_msg for p in _TRANSIENT_RESULT_PATTERNS)
+
+
 def run(prompt: str, project_path: Path, log_path: Path,
         claude_bin: str | None = None,
-        timeout: int = DEFAULT_TIMEOUT) -> Outcome:
-    """Roep `claude -p` aan en parse de structured JSON output."""
+        timeout: int = DEFAULT_TIMEOUT,
+        max_retries: int = DEFAULT_MAX_RETRIES) -> Outcome:
+    """Roep `claude -p` aan en parse de structured JSON output. Retry bij
+    transient API-fouten (stream idle, broken pipe e.d.) met backoff."""
     bin_path = _resolve_claude_bin(claude_bin)
     env = _enrich_path(os.environ.copy())
     cmd = [
@@ -247,6 +282,28 @@ def run(prompt: str, project_path: Path, log_path: Path,
         '--no-session-persistence',
         '--debug-file', str(log_path),
     ]
+    outcome: Outcome | None = None
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            delay = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
+            log.warning(
+                f'Claude transient API-fout: {outcome.summary!r}. '
+                f'Retry {attempt}/{max_retries} na {delay}s.'
+            )
+            time.sleep(delay)
+        outcome, transient = _run_once(cmd, project_path, env, log_path, timeout)
+        if not transient:
+            return outcome
+    return Outcome(
+        'error',
+        f'Claude API onbereikbaar na {max_retries + 1} pogingen: {outcome.summary} '
+        'Probeer de mail over een paar minuten opnieuw te sturen.',
+    )
+
+
+def _run_once(cmd: list[str], project_path: Path, env: dict[str, str],
+              log_path: Path, timeout: int) -> tuple[Outcome, bool]:
+    """Eén poging. Tweede returnwaarde geeft aan of de fout transient is."""
     # start_new_session=True zet claude in een eigen process-group, zodat we na
     # afloop killpg kunnen doen op orphan children (background dev-server,
     # http.server uit de verificatiefase) zonder onze eigen Python te raken.
@@ -259,15 +316,14 @@ def run(prompt: str, project_path: Path, log_path: Path,
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            return Outcome('error', f'Claude Code timed out after {timeout}s')
+            return Outcome('error', f'Claude Code timed out after {timeout}s'), False
         returncode = proc.returncode
 
         if returncode != 0:
-            if log_path:
-                log_path.write_text(
-                    f'EXIT {returncode}\n--- STDERR ---\n{stderr or ""}\n'
-                    f'--- STDOUT ---\n{stdout or ""}\n'
-                )
+            log_path.write_text(
+                f'EXIT {returncode}\n--- STDERR ---\n{stderr or ""}\n'
+                f'--- STDOUT ---\n{stdout or ""}\n'
+            )
             try:
                 payload = json.loads(stdout)
             except (json.JSONDecodeError, TypeError):
@@ -277,13 +333,16 @@ def run(prompt: str, project_path: Path, log_path: Path,
                     return Outcome('error', (
                         f'Taak te complex of vastgelopen na {DEFAULT_MAX_TURNS} stappen. '
                         'Splits het verzoek op in kleinere wijzigingen.'
-                    ))
+                    )), False
+                if _is_transient_failure(payload):
+                    result_msg = (payload.get('result') or '').strip() or 'transient API failure'
+                    return Outcome('error', result_msg), True
                 result_msg = payload.get('result')
                 if isinstance(result_msg, str) and result_msg.strip():
-                    return Outcome('error', f'Claude exit {returncode}: {result_msg.strip()}')
+                    return Outcome('error', f'Claude exit {returncode}: {result_msg.strip()}'), False
             stderr_tail = ' | '.join((stderr or '').strip().splitlines()[-3:])
             stdout_tail = (stdout or '').strip()[:200]
-            return Outcome('error', f'Claude exit {returncode}: {stderr_tail or stdout_tail}')
+            return Outcome('error', f'Claude exit {returncode}: {stderr_tail or stdout_tail}'), False
 
         try:
             payload = json.loads(stdout)
@@ -291,14 +350,14 @@ def run(prompt: str, project_path: Path, log_path: Path,
             action = structured['action']
             summary = structured['summary']
         except (json.JSONDecodeError, KeyError, TypeError) as e:
-            return Outcome('error', f'Output parsing failed: {e}')
+            return Outcome('error', f'Output parsing failed: {e}'), False
 
         if action not in ('committed', 'clarify', 'reject'):
-            return Outcome('error', f'Unknown action: {action}')
+            return Outcome('error', f'Unknown action: {action}'), False
 
         verify_url = structured.get('verify_url') if isinstance(structured, dict) else None
         if not (isinstance(verify_url, str) and verify_url.startswith(('http://', 'https://'))):
             verify_url = None
-        return Outcome(action, summary, verify_url)
+        return Outcome(action, summary, verify_url), False
     finally:
         _kill_process_group(proc)

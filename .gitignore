@@ -12,5 +12,9 @@ wheels/
 # Lokale config (credentials, token, state, lock) - niet in repo
 config/
 
+# Project-definities bevatten paden, e-mails en whitelist van derden;
+# committeer alleen config.toml.example als template.
+config.toml
+
 # Lokale logs
 logs/

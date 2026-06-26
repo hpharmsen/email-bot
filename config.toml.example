@@ -1,0 +1,33 @@
+# Project-definities voor de email-bot.
+#
+# Kopieer dit bestand naar `config.toml` en pas aan voor je eigen projecten.
+# `config.toml` zelf is gitignored; alleen deze .example wordt gecommit.
+#
+# Per project:
+#   path           = absolute pad naar de project-folder (moet een git-repo zijn)
+#   email          = ontvangend e-mailadres
+#   whitelist      = extra senders die mogen mailen. De OWNER_EMAIL (zie
+#                    src/email_bot/main.py) staat altijd impliciet in de
+#                    whitelist; hoef je hier niet te herhalen.
+#   live_url       = optioneel; wordt opgenomen in de succes-reply
+#   alias_name     = optioneel; display-naam in "From" (default: project key,
+#                    gecapitaliseerd)
+#   publish_script = optioneel; pad (relatief aan project) naar deploy-script
+#                    dat na een succesvolle git push wordt uitgevoerd.
+#
+# Het ontvangend e-mailadres is bepalend voor om welk project het gaat.
+
+[projects.demo-site]
+path = "/path/to/your/project"
+email = "demo-site@example.com"
+whitelist = ["collaborator@example.org"]
+live_url = "https://demo.example.com"
+alias_name = "Demo Site"
+
+[projects.client-site]
+path = "/path/to/another/project"
+email = "client-site@example.com"
+whitelist = ["client@example.org"]
+live_url = "https://client.example.com"
+alias_name = "Client Site"
+publish_script = "publish.sh"

@@ -19,7 +19,7 @@ def test_load_basic_project(tmp_path: Path) -> None:
 [projects.bra1n]
 path = "/Users/hp/ai/Bra1n/website"
 email = "bra1n@harmsen.nl"
-whitelist = ["michael@anderswinst.com"]
+whitelist = ["collaborator@example.org"]
 """)
     projects = load_projects(cfg)
     assert set(projects.keys()) == {'bra1n@harmsen.nl'}
@@ -27,7 +27,7 @@ whitelist = ["michael@anderswinst.com"]
     assert p.name == 'bra1n'
     assert p.path == Path('/Users/hp/ai/Bra1n/website')
     assert p.email == 'bra1n@harmsen.nl'
-    assert 'michael@anderswinst.com' in p.whitelist
+    assert 'collaborator@example.org' in p.whitelist
     assert OWNER_EMAIL in p.whitelist     # impliciet altijd whitelisted
     assert p.live_url is None
     assert p.alias_name == 'Bra1n'

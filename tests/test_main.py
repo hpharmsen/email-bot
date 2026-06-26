@@ -61,8 +61,8 @@ def test_owner_always_in_whitelist() -> None:
 
 
 def test_in_whitelist_case_insensitive() -> None:
-    p = _project(extra_whitelist=['michael@anderswinst.com'])
-    assert M.in_whitelist('MICHAEL@ANDERSWINST.COM', p) is True
+    p = _project(extra_whitelist=['collaborator@example.org'])
+    assert M.in_whitelist('COLLABORATOR@EXAMPLE.ORG', p) is True
     assert M.in_whitelist('other@x', p) is False
 
 

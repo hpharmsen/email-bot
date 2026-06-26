@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from email_bot.claude_runner import (
-    Outcome, _is_transient_failure, _load_env_file, build_prompt, run,
+    Outcome, _is_transient_failure, _load_env_file, _read_head, build_prompt, run,
 )
 from email_bot.gmail_client import ParsedMessage
 
@@ -36,10 +36,12 @@ def _mock_proc(stdout='', stderr='', returncode=0, timeout=False) -> MagicMock:
 
 
 @contextmanager
-def _patched_popen(proc: MagicMock):
-    """Patch Popen + suppress process-group cleanup (no real PIDs in tests)."""
+def _patched_popen(proc: MagicMock, head: str | None = None):
+    """Patch Popen + suppress process-group cleanup + stub _read_head (geen echte
+    git-call op tmp_path)."""
     with patch('email_bot.claude_runner.subprocess.Popen', return_value=proc), \
-            patch('email_bot.claude_runner._kill_process_group'):
+            patch('email_bot.claude_runner._kill_process_group'), \
+            patch('email_bot.claude_runner._read_head', return_value=head):
         yield
 
 
@@ -219,7 +221,8 @@ def test_run_starts_new_session_for_process_group_cleanup(tmp_path):
     stdout = json.dumps({'action': 'committed', 'summary': 'OK.'})
     proc = _mock_proc(stdout=stdout)
     with patch('email_bot.claude_runner.subprocess.Popen', return_value=proc) as popen, \
-            patch('email_bot.claude_runner._kill_process_group') as killpg:
+            patch('email_bot.claude_runner._kill_process_group') as killpg, \
+            patch('email_bot.claude_runner._read_head', return_value=None):
         run('p', tmp_path, tmp_path / 'log.txt')
     assert popen.call_args.kwargs.get('start_new_session') is True
     killpg.assert_called_once_with(proc)
@@ -228,7 +231,8 @@ def test_run_starts_new_session_for_process_group_cleanup(tmp_path):
 def test_run_kills_process_group_even_on_timeout(tmp_path):
     with patch('email_bot.claude_runner.subprocess.Popen',
                return_value=_mock_proc(timeout=True)), \
-            patch('email_bot.claude_runner._kill_process_group') as killpg:
+            patch('email_bot.claude_runner._kill_process_group') as killpg, \
+            patch('email_bot.claude_runner._read_head', return_value=None):
         run('p', tmp_path, tmp_path / 'log.txt', timeout=10)
     assert killpg.called
 
@@ -278,6 +282,7 @@ def test_run_retries_transient_failure_then_succeeds(tmp_path):
     proc_ok = _mock_proc(stdout=success_stdout, returncode=0)
     with patch('email_bot.claude_runner.subprocess.Popen', side_effect=[proc_fail, proc_ok]), \
             patch('email_bot.claude_runner._kill_process_group'), \
+            patch('email_bot.claude_runner._read_head', return_value=None), \
             patch('email_bot.claude_runner.time.sleep') as sleep:
         outcome = run('p', tmp_path, tmp_path / 'log.txt')
     assert outcome.kind == 'committed'
@@ -289,6 +294,7 @@ def test_run_exhausts_retries_on_persistent_transient_failure(tmp_path):
     proc_fail = _mock_proc(stdout=_transient_payload(), returncode=1)
     with patch('email_bot.claude_runner.subprocess.Popen', return_value=proc_fail) as popen, \
             patch('email_bot.claude_runner._kill_process_group'), \
+            patch('email_bot.claude_runner._read_head', return_value=None), \
             patch('email_bot.claude_runner.time.sleep') as sleep:
         outcome = run('p', tmp_path, tmp_path / 'log.txt')
     assert popen.call_count == 3  # 1 + 2 retries
@@ -308,6 +314,7 @@ def test_run_does_not_retry_non_transient_error(tmp_path):
     proc = _mock_proc(stdout=bad, returncode=1)
     with patch('email_bot.claude_runner.subprocess.Popen', return_value=proc) as popen, \
             patch('email_bot.claude_runner._kill_process_group'), \
+            patch('email_bot.claude_runner._read_head', return_value=None), \
             patch('email_bot.claude_runner.time.sleep') as sleep:
         outcome = run('p', tmp_path, tmp_path / 'log.txt')
     assert popen.call_count == 1
@@ -324,6 +331,7 @@ def test_run_does_not_retry_max_turns_error(tmp_path):
     proc = _mock_proc(stdout=stdout, returncode=1)
     with patch('email_bot.claude_runner.subprocess.Popen', return_value=proc) as popen, \
             patch('email_bot.claude_runner._kill_process_group'), \
+            patch('email_bot.claude_runner._read_head', return_value=None), \
             patch('email_bot.claude_runner.time.sleep') as sleep:
         outcome = run('p', tmp_path, tmp_path / 'log.txt')
     assert popen.call_count == 1
@@ -338,6 +346,72 @@ def test_run_success_first_attempt_no_sleep(tmp_path):
             patch('email_bot.claude_runner.time.sleep') as sleep:
         run('p', tmp_path, tmp_path / 'log.txt')
     sleep.assert_not_called()
+
+
+# --- retry op wall-clock timeout (subprocess hangt, HEAD onveranderd) ---
+
+def test_run_retries_timeout_when_head_unchanged(tmp_path):
+    """Subprocess hangt 25 min op een API-stream zonder dat Claude er zelf op
+    afkapt; main.py heeft snapshot, dus retry is veilig zolang HEAD niet bewoog."""
+    success_stdout = json.dumps({'action': 'committed', 'summary': 'Klaar.'})
+    proc_timeout = _mock_proc(timeout=True)
+    proc_ok = _mock_proc(stdout=success_stdout)
+    with patch('email_bot.claude_runner.subprocess.Popen',
+               side_effect=[proc_timeout, proc_ok]), \
+            patch('email_bot.claude_runner._kill_process_group'), \
+            patch('email_bot.claude_runner._read_head', return_value='abc123'), \
+            patch('email_bot.claude_runner.time.sleep') as sleep:
+        outcome = run('p', tmp_path, tmp_path / 'log.txt', timeout=10)
+    assert outcome.kind == 'committed'
+    sleep.assert_called_once_with(30)
+
+
+def test_run_does_not_retry_timeout_when_head_moved(tmp_path):
+    """Timeout na een commit = werk is gedaan; retry zou dubbele commits riskeren."""
+    proc_timeout = _mock_proc(timeout=True)
+    heads = iter(['abc123', 'def456'])  # pre, post
+    with patch('email_bot.claude_runner.subprocess.Popen',
+               return_value=proc_timeout) as popen, \
+            patch('email_bot.claude_runner._kill_process_group'), \
+            patch('email_bot.claude_runner._read_head',
+                  side_effect=lambda _: next(heads)), \
+            patch('email_bot.claude_runner.time.sleep') as sleep:
+        outcome = run('p', tmp_path, tmp_path / 'log.txt', timeout=10)
+    assert popen.call_count == 1
+    sleep.assert_not_called()
+    assert outcome.kind == 'error'
+    assert 'timed out' in outcome.summary
+
+
+def test_run_does_not_retry_timeout_when_not_git_repo(tmp_path):
+    """Geen git-repo = kunnen veiligheid niet vaststellen; default niet retryen."""
+    proc_timeout = _mock_proc(timeout=True)
+    with patch('email_bot.claude_runner.subprocess.Popen',
+               return_value=proc_timeout) as popen, \
+            patch('email_bot.claude_runner._kill_process_group'), \
+            patch('email_bot.claude_runner._read_head', return_value=None), \
+            patch('email_bot.claude_runner.time.sleep') as sleep:
+        outcome = run('p', tmp_path, tmp_path / 'log.txt', timeout=10)
+    assert popen.call_count == 1
+    sleep.assert_not_called()
+
+
+# --- _read_head ---
+
+def test_read_head_returns_hash_for_real_repo(tmp_path):
+    sp = subprocess
+    sp.run(['git', 'init', '-q', '-b', 'main'], cwd=str(tmp_path), check=True)
+    sp.run(['git', 'config', 'user.email', 't@t.com'], cwd=str(tmp_path), check=True)
+    sp.run(['git', 'config', 'user.name', 'Test'], cwd=str(tmp_path), check=True)
+    (tmp_path / 'a.txt').write_text('hi')
+    sp.run(['git', 'add', '.'], cwd=str(tmp_path), check=True)
+    sp.run(['git', 'commit', '-q', '-m', 'init'], cwd=str(tmp_path), check=True)
+    head = _read_head(tmp_path)
+    assert head is not None and len(head) == 40
+
+
+def test_read_head_returns_none_outside_git_repo(tmp_path):
+    assert _read_head(tmp_path) is None
 
 
 # --- _load_env_file ---

@@ -245,6 +245,20 @@ Daarna: return {{"action":"committed","summary":"<1-2 zinnen wat je deed>","veri
 """
 
 
+def _read_head(project_path: Path) -> str | None:
+    """Huidige git HEAD, of None als geen git-repo of fout. Voor de
+    timeout-retry: alleen retry als pre- en post-HEAD gelijk zijn (= geen
+    commit gedaan, dus geen risico op duplicaat-werk)."""
+    try:
+        proc = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=str(project_path), capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
 def _is_transient_failure(payload: dict) -> bool:
     """Exit non-zero met 0 tokens en 0 turns = Claude heeft de prompt nooit
     verwerkt (API-stream idle, broken pipe). Veilig om te retryen — er is geen
@@ -282,28 +296,32 @@ def run(prompt: str, project_path: Path, log_path: Path,
         '--no-session-persistence',
         '--debug-file', str(log_path),
     ]
+    pre_head = _read_head(project_path)
     outcome: Outcome | None = None
     for attempt in range(max_retries + 1):
         if attempt > 0:
             delay = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
             log.warning(
-                f'Claude transient API-fout: {outcome.summary!r}. '
+                f'Claude transient fout: {outcome.summary!r}. '
                 f'Retry {attempt}/{max_retries} na {delay}s.'
             )
             time.sleep(delay)
-        outcome, transient = _run_once(cmd, project_path, env, log_path, timeout)
+        outcome, transient = _run_once(cmd, project_path, env, log_path, timeout, pre_head)
         if not transient:
             return outcome
     return Outcome(
         'error',
-        f'Claude API onbereikbaar na {max_retries + 1} pogingen: {outcome.summary} '
+        f'Claude onbereikbaar na {max_retries + 1} pogingen: {outcome.summary} '
         'Probeer de mail over een paar minuten opnieuw te sturen.',
     )
 
 
 def _run_once(cmd: list[str], project_path: Path, env: dict[str, str],
-              log_path: Path, timeout: int) -> tuple[Outcome, bool]:
-    """Eén poging. Tweede returnwaarde geeft aan of de fout transient is."""
+              log_path: Path, timeout: int,
+              pre_head: str | None) -> tuple[Outcome, bool]:
+    """Eén poging. Tweede returnwaarde geeft aan of de fout transient is.
+    `pre_head`: git HEAD voor de run; gebruikt om bij timeout te bepalen of er
+    nog werk gedaan kan zijn — alleen retryen als HEAD niet bewoog."""
     # start_new_session=True zet claude in een eigen process-group, zodat we na
     # afloop killpg kunnen doen op orphan children (background dev-server,
     # http.server uit de verificatiefase) zonder onze eigen Python te raken.
@@ -316,7 +334,8 @@ def _run_once(cmd: list[str], project_path: Path, env: dict[str, str],
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            return Outcome('error', f'Claude Code timed out after {timeout}s'), False
+            head_unchanged = pre_head is not None and _read_head(project_path) == pre_head
+            return Outcome('error', f'Claude Code timed out after {timeout}s'), head_unchanged
         returncode = proc.returncode
 
         if returncode != 0:
